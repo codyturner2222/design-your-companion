@@ -52,6 +52,7 @@ function joinScreen(err = '') {
     h('p', { class: 'muted' }, 'Enter the room code on the screen.'),
     input, h('p', { class: 'error' }, err),
     h('button', { class: 'btn block', onclick: go }, 'Join'),
+    h('p', { class: 'muted', style: 'margin-top:28px;text-align:center;font-size:.95rem' }, 'Instructor? ', h('a', { href: '/host', style: 'color:inherit;font-weight:700' }, 'Start a session')),
   )));
   if (params.get('room')) go();
 }
