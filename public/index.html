@@ -64,7 +64,11 @@ function join(c) {
     studentId = r.studentId; store.set('cl:' + code, studentId);
     history.replaceState(null, '', '/?room=' + code);
     S = r.state;
-    draft = { name: S.name || '', answers: { ...S.answers } };
+    // keep unsaved local answers if this is a reconnect mid-design
+    if (!draft || S.locked) draft = { name: S.name || '', answers: { ...S.answers } };
+    else socket.emit('student:draft', draft);
+    // reopen an active chat so messages sent while offline show up
+    if (chat && S.phase === 'chat') return openChat(chat.meta.botId);
     render();
   });
 }
