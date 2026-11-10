@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: companion-lab
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: HOST_PASSWORD
+        sync: false
+      - key: MODEL
+        value: claude-haiku-5-5

@@ -1,0 +1,15 @@
+{
+  "name": "companion-lab",
+  "version": "1.0.0",
+  "description": "Design Your Companion: students design an AI companion, see the class reveal, then chat with what they built.",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^1.7.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "qrcode": "^1.5.4",
+    "socket.io": "^4.8.1"
+  }
+}

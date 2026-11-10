@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Companion Lab · Instructor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700;12..96,800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="app" class="host"></div>
+<script src="/socket.io/socket.io.js"></script>
+<script src="/questions.js"></script>
+<script>
+const socket = io();
+const $app = document.getElementById('app');
+const h = (tag, attrs = {}, ...kids) => {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === 'class') el.className = v;
+    else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+    else if (v !== false && v !== null && v !== undefined) el.setAttribute(k, v === true ? '' : v);
+  }
+  kids.flat().forEach((c) => c !== null && c !== undefined && el.append(c.nodeType ? c : document.createTextNode(c)));
+  return el;
+};
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+};
+let H = null;
+let password = '';
+let lastPhase = null;
+
+function setup(err = '') {
+  const pw = h('input', { class: 'text-input', type: 'password', placeholder: 'Instructor password (if you set one)', value: password });
+  const rc = h('input', { class: 'text-input', placeholder: 'Room code', maxlength: 4, style: 'text-transform:uppercase', value: store.get('cl:hostRoom') || '' });
+  $app.replaceChildren(h('div', { class: 'phone' }, h('div', { class: 'screen center-screen' },
+    h('h1', {}, 'Companion Lab'),
+    h('p', { class: 'muted' }, 'Students design an AI companion, see what the room built, then talk to it.'),
+    pw, h('div', { style: 'height:10px' }),
+    h('button', { class: 'btn block', onclick: () => { password = pw.value; create(); } }, 'Start a new session'),
+    h('p', { class: 'muted', style: 'margin:22px 0 8px' }, 'Or go back to a session you already started:'),
+    rc, h('div', { style: 'height:10px' }),
+    h('button', { class: 'btn secondary block', onclick: () => { password = pw.value; rejoin(rc.value); } }, 'Open session'),
+    h('p', { class: 'error' }, err),
+  )));
+}
+function create() {
+  socket.emit('host:create', { password }, (r) => {
+    if (r.error) return setup(r.error);
+    H = r.state; store.set('cl:hostRoom', H.code); render();
+  });
+}
+function rejoin(code) {
+  socket.emit('host:join', { code: String(code).toUpperCase(), password }, (r) => {
+    if (r.error) return setup(r.error);
+    H = r.state; render();
+  });
+}
+socket.on('connect', () => { if (H) rejoin(H.code); });
+socket.on('host:state', (st) => { H = st; render(); });
+
+// ---------------------------------------------------------- frame
+function bar() {
+  const tab = (id, label) => h('button', { class: 'tab', 'aria-pressed': String(H.phase === id), onclick: () => socket.emit('host:phase', { phase: id }) }, label);
+  const tog = (key, label) => {
+    const cb = h('input', { type: 'checkbox' }); cb.checked = !!H[key];
+    cb.addEventListener('change', () => socket.emit('host:toggle', { key, value: cb.checked }));
+    return h('label', {}, cb, label);
+  };
+  return h('div', { class: 'host-bar' },
+    h('span', { class: 'code' }, H.code),
+    h('div', { class: 'tabs' }, tab('design', 'Design'), tab('reveal', 'Reveal'), tab('followup', 'Follow-up'), tab('chat', 'Chat')),
+    h('div', { class: 'toggles' },
+      tog('showLabels', "Show Aristotle's labels to students"),
+      tog('classCompanion', 'Class companion'),
+      tog('allowSwap', "Talk to classmates' companions")),
+    H.mock ? h('span', { class: 'muted', style: 'width:100%;font-size:.85rem' }, 'Test mode: no ANTHROPIC_API_KEY is set, so companions give canned replies.') : null,
+  );
+}
+
+function render() {
+  if (!H) return setup();
+  const main = h('div', { class: 'host-main' });
+  const views = { design: designView, reveal: revealView, followup: followupView, chat: chatView };
+  views[H.phase](main);
+  $app.replaceChildren(bar(), main);
+  lastPhase = H.phase;
+}
+
+// ---------------------------------------------------------- design
+function designView(main) {
+  const a = H.agg;
+  main.append(h('div', { class: 'join' },
+    h('img', { src: H.qr, alt: 'QR code to join' }),
+    h('div', {},
+      h('h1', { style: 'font-size:2.6rem' }, 'Design your ideal AI companion'),
+      h('p', { class: 'url' }, 'Scan the code, or go to ', h('strong', {}, H.joinUrl.replace(/^https?:\/\//, '').replace(/\/\?room=.*/, '')), ' and enter'),
+      h('div', { class: 'bigcode' }, H.code),
+      h('div', { class: 'counter' }, `${a.locked} of ${a.joined} locked in`),
+    )));
+}
+
+// ---------------------------------------------------------- reveal
+function revealView(main) {
+  const a = H.agg;
+  if (!a.locked) { main.append(h('h2', {}, 'No companions locked in yet.')); return; }
+  const animate = lastPhase !== 'reveal';
+
+  // the mirror-to-friend scale
+  const track = h('div', { class: 'scale-track' }, h('div', { class: 'scale-line' }));
+  const dots = [];
+  const sorted = [...a.totals].sort((x, y) => x - y);
+  const stack = {};
+  sorted.forEach((t) => {
+    const bucket = Math.round(t / 3); const n = (stack[bucket] = (stack[bucket] || 0) + 1) - 1;
+    const top = 54 + (n % 2 ? 1 : -1) * Math.ceil(n / 2) * 14;
+    const d = h('div', { class: 'scale-dot', style: `left:${animate ? 50 : t}%;top:${top}px` });
+    dots.push([d, t]); track.append(d);
+  });
+  const avg = h('div', { class: 'scale-avg', style: `left:${animate ? 50 : a.roomScore}%` }, h('span', {}, `Room: ${a.roomScore}`));
+  track.append(avg);
+  main.append(h('div', { class: 'scale' },
+    h('div', { class: 'section-head' }, h('h2', {}, 'How much of a real friendship did the room keep?'), h('span', { class: 'muted' }, `${a.locked} companions`)),
+    track,
+    h('div', { class: 'scale-ends' }, h('span', { class: 'm' }, 'Mirror'), h('span', { class: 'f' }, 'Friend')),
+  ));
+  if (animate) requestAnimationFrame(() => requestAnimationFrame(() => { dots.forEach(([d, t]) => (d.style.left = t + '%')); avg.style.left = a.roomScore + '%'; }));
+
+  // pillars
+  main.append(h('div', { class: 'grid-4' }, CQ.PILLARS.map((p) => h('div', { class: 'pillar-card' },
+    h('h3', {}, p.label), h('div', { class: 'num' }, a.pillars[p.id]),
+    h('div', { class: 'bar' }, h('i', { style: `width:${a.pillars[p.id]}%` })),
+    h('p', { class: 'muted', style: 'margin:10px 0 0;font-size:.9rem' }, p.blurb)))));
+
+  // the companion the room built
+  const built = h('div', { class: 'built-cols' });
+  CQ.ALL.forEach((q) => built.append(h('div', { class: 'built-item' }, h('span', {}, q.short), h('span', {}, CQ.describe(q, a.classAnswers[q.id])))));
+  main.append(h('div', { class: 'built' }, h('div', { class: 'section-head' }, h('h2', {}, 'The companion the room built'), h('span', { class: 'muted' }, 'Most common answer, or the average for sliders')), built));
+
+  // per-question detail
+  CQ.PILLARS.forEach((p) => {
+    main.append(h('h2', { style: 'margin:28px 0 12px' }, p.label));
+    const grid = h('div', { class: 'qgrid' });
+    p.questions.forEach((q) => grid.append(qcard(q, a.questions[q.id], a.locked)));
+    main.append(grid);
+  });
+}
+function qcard(q, d, n) {
+  const card = h('div', { class: 'qcard' }, h('h3', {}, q.label));
+  if (q.type === 'slider') {
+    const pct = (v) => ((v - q.min) / (q.max - q.min)) * 100;
+    const strip = h('div', { class: 'strip' });
+    d.values.forEach((v) => strip.append(h('i', { style: `left:${pct(v)}%` })));
+    strip.append(h('b', { style: `left:${pct(d.mean)}%` }));
+    card.append(h('p', {}, h('strong', {}, `Average: ${q.unit === '%' ? Math.round(d.mean) + '%' : Math.round(d.mean)}`)), strip,
+      h('div', { class: 'slider-ends' }, h('span', {}, q.minLabel), h('span', {}, q.maxLabel)));
+  } else {
+    q.options.forEach((o) => {
+      const c = d.counts[o.id] || 0; const pc = n ? Math.round((c / n) * 100) : 0;
+      card.append(h('div', { class: 'hbar' }, h('span', {}, o.label), h('div', { class: 'bar' }, h('i', { style: `width:${pc}%` })), h('span', {}, pc + '%')));
+    });
+  }
+  return card;
+}
+
+// ---------------------------------------------------------- follow-up
+function followupView(main) {
+  const a = H.agg;
+  main.append(h('h1', { style: 'margin-bottom:20px' }, 'Look at what the room built'));
+  main.append(h('div', { class: 'fu-grid' }, CQ.FOLLOWUPS.map((f) => {
+    const counts = a.followups[f.id]; const n = Object.values(counts).reduce((x, y) => x + y, 0);
+    return h('div', { class: 'fu-card' }, h('h2', {}, f.question),
+      f.options.map((o) => { const pc = n ? Math.round((counts[o.id] / n) * 100) : 0;
+        return h('div', { class: 'hbar' }, h('span', {}, o.label), h('div', { class: 'bar' }, h('i', { style: `width:${pc}%` })), h('span', {}, pc + '%')); }),
+      h('p', { class: 'muted', style: 'margin-top:12px' }, `${n} vote${n === 1 ? '' : 's'}`));
+  })));
+}
+
+// ---------------------------------------------------------- chat
+function chatView(main) {
+  const a = H.agg;
+  main.append(h('div', { class: 'join', style: 'min-height:auto;margin-bottom:28px' },
+    h('img', { src: H.qr, alt: 'QR code to join', style: 'width:220px;height:220px' }),
+    h('div', {},
+      h('h1', { style: 'font-size:2.4rem' }, 'Now talk to it'),
+      h('p', { class: 'url' }, 'Open your companion and start a conversation. Does it still feel like what you wanted?'),
+      h('div', { class: 'counter' }, `${a.chatting} chatting now, ${a.messages} messages sent` + (a.ended ? `, ${a.ended} relationship${a.ended > 1 ? 's' : ''} ended by the companion` : '')),
+    )));
+  if (H.classCompanion && a.classAnswers) {
+    const built = h('div', { class: 'built-cols' });
+    CQ.ALL.forEach((q) => built.append(h('div', { class: 'built-item' }, h('span', {}, q.short), h('span', {}, CQ.describe(q, a.classAnswers[q.id])))));
+    main.append(h('div', { class: 'built' }, h('div', { class: 'section-head' }, h('h2', {}, 'The Class Companion'), h('span', { class: 'muted' }, 'Everyone can talk to this one')), built));
+  }
+}
+
+const saved = store.get('cl:hostRoom');
+setup();
+</script>
+</body>
+</html>

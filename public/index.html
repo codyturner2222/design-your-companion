@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Design Your Companion</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700;12..96,800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="app"></div>
+<div id="banner" class="banner" role="status" aria-live="polite"><strong id="bannerFrom"></strong><span id="bannerText"></span></div>
+
+<script src="/socket.io/socket.io.js"></script>
+<script src="/questions.js"></script>
+<script>
+const socket = io();
+const $app = document.getElementById('app');
+const h = (tag, attrs = {}, ...kids) => {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === 'class') el.className = v;
+    else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+    else if (v !== false && v !== null && v !== undefined) el.setAttribute(k, v === true ? '' : v);
+  }
+  kids.flat().forEach((c) => c !== null && c !== undefined && el.append(c.nodeType ? c : document.createTextNode(c)));
+  return el;
+};
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+};
+
+let S = null;            // latest student state from server
+let code = null, studentId = null;
+let draft = null;        // { name, answers }
+let page = 0;            // 0 = name, 1..4 = pillars
+let chat = null;         // { meta, messages, ended, typing }
+let editing = null;      // answers being edited during chat
+let lateDesign = false;  // designing after chat has opened (late arrival)
+
+// ---------------------------------------------------------- join
+function joinScreen(err = '') {
+  const params = new URLSearchParams(location.search);
+  const input = h('input', { class: 'text-input', id: 'code', maxlength: 4, autocomplete: 'off', autocapitalize: 'characters', placeholder: 'ABCD', value: params.get('room') || '', 'aria-label': 'Room code', style: 'font-size:1.6rem;letter-spacing:.2em;text-align:center;text-transform:uppercase' });
+  const go = () => join(input.value);
+  input.addEventListener('keydown', (e) => e.key === 'Enter' && go());
+  $app.replaceChildren(h('div', { class: 'phone' }, h('div', { class: 'screen center-screen' },
+    h('h1', {}, 'Design your companion'),
+    h('p', { class: 'muted' }, 'Enter the room code on the screen.'),
+    input, h('p', { class: 'error' }, err),
+    h('button', { class: 'btn block', onclick: go }, 'Join'),
+  )));
+  if (params.get('room')) go();
+}
+function join(c) {
+  code = String(c || '').toUpperCase().trim();
+  if (!code) return joinScreen('Enter the code first.');
+  socket.emit('student:join', { code, studentId: store.get('cl:' + code) }, (r) => {
+    if (r.error) return joinScreen(r.error);
+    studentId = r.studentId; store.set('cl:' + code, studentId);
+    history.replaceState(null, '', '/?room=' + code);
+    S = r.state;
+    draft = { name: S.name || '', answers: { ...S.answers } };
+    render();
+  });
+}
+socket.on('connect', () => { if (code && studentId) join(code); });
+socket.on('student:state', (st) => {
+  const phaseChanged = !S || S.phase !== st.phase || S.locked !== st.locked;
+  S = st;
+  if (chat && st.phase !== 'chat') chat = null;
+  if (phaseChanged || !chat) render();
+});
+
+// ---------------------------------------------------------- question widgets
+function pillarTitle(p) { return S && S.showLabels ? p.label : p.neutral; }
+
+function questionEl(q, answers, onChange) {
+  const v = answers[q.id];
+  if (q.type === 'slider') {
+    const val = h('div', { class: 'slider-value' }, CQ.describe(q, v));
+    const range = h('input', { type: 'range', min: q.min, max: q.max, step: q.step, value: v, 'aria-label': q.label });
+    range.addEventListener('input', () => { answers[q.id] = Number(range.value); val.textContent = CQ.describe(q, answers[q.id]); onChange(); });
+    const ends = h('div', { class: 'slider-ends' }, h('span', {}, q.minLabel), q.midLabel ? h('span', { class: 'mid' }, q.midLabel) : null, h('span', {}, q.maxLabel));
+    return h('div', { class: 'qblock' }, h('h3', {}, q.label), h('div', { class: 'slider-wrap' }, val, range, ends));
+  }
+  const group = h('div', { class: 'choices', role: 'radiogroup', 'aria-label': q.label });
+  q.options.forEach((o) => {
+    const b = h('button', { class: 'choice', role: 'radio', 'aria-checked': String(v === o.id), type: 'button' }, h('span', { class: 'dot' }), h('span', {}, o.label));
+    b.addEventListener('click', () => {
+      answers[q.id] = o.id;
+      group.querySelectorAll('.choice').forEach((x) => x.setAttribute('aria-checked', 'false'));
+      b.setAttribute('aria-checked', 'true');
+      onChange();
+    });
+    group.append(b);
+  });
+  return h('div', { class: 'qblock' }, h('h3', {}, q.label), group);
+}
+
+// ---------------------------------------------------------- design
+let draftTimer = null;
+function saveDraft() {
+  clearTimeout(draftTimer);
+  draftTimer = setTimeout(() => socket.emit('student:draft', draft), 400);
+}
+function pageComplete(i) {
+  if (i === 0) return true;
+  return CQ.PILLARS[i - 1].questions.every((q) => draft.answers[q.id] !== null && draft.answers[q.id] !== undefined);
+}
+function designScreen(err = '') {
+  const total = CQ.PILLARS.length + 1;
+  const progress = h('div', { class: 'progress', 'aria-hidden': 'true' }, Array.from({ length: total }, (_, i) => h('span', { class: i <= page ? 'done' : '' })));
+  const body = h('div', { class: 'screen' });
+  const next = h('button', { class: 'btn' });
+  const back = h('button', { class: 'btn secondary', onclick: () => { page--; render(); scrollTo(0, 0); } }, 'Back');
+  const refresh = () => {
+    next.disabled = !pageComplete(page);
+    if (page > 0) {
+      const left = CQ.PILLARS[page - 1].questions.filter((q) => draft.answers[q.id] === null || draft.answers[q.id] === undefined).length;
+      next.textContent = left ? `${left} question${left > 1 ? 's' : ''} left` : (page === total - 1 ? 'Lock in my companion' : 'Next');
+    }
+  };
+
+  if (page === 0) {
+    const name = h('input', { class: 'text-input', maxlength: 24, placeholder: 'e.g. Juniper', value: draft.name, 'aria-label': 'Companion name' });
+    name.addEventListener('input', () => { draft.name = name.value; saveDraft(); });
+    body.append(
+      h('h1', {}, 'Design your ideal AI companion'),
+      h('p', {}, 'Your companion is a friend who is there for you every day. Set every dial the way you would actually want it. Nobody sees your answers until the reveal, and then only as part of the whole room.'),
+      h('div', { class: 'qblock' }, h('h3', {}, 'Give your companion a name'), name),
+    );
+    next.textContent = 'Start';
+  } else {
+    const p = CQ.PILLARS[page - 1];
+    body.append(h('h2', {}, pillarTitle(p)));
+    if (S.showLabels) body.append(h('p', { class: 'muted' }, p.blurb));
+    p.questions.forEach((q) => body.append(questionEl(q, draft.answers, () => { refresh(); saveDraft(); })));
+    next.textContent = page === total - 1 ? 'Lock in my companion' : 'Next';
+    if (err) body.append(h('p', { class: 'error' }, err));
+  }
+  next.addEventListener('click', () => {
+    if (page < total - 1) { page++; render(); scrollTo(0, 0); return; }
+    socket.emit('student:lock', draft, (r) => { if (r.error) designScreen(r.error); });
+  });
+  refresh();
+  $app.replaceChildren(h('div', { class: 'phone' }, topbar(), progress, body,
+    h('div', { class: 'sticky-bar' }, h('div', { class: 'inner' }, page > 0 ? back : null, next))));
+}
+
+function topbar() {
+  return h('div', { class: 'topbar' }, h('strong', {}, 'Companion Lab'), h('span', {}, 'Room ' + code));
+}
+
+function lockedScreen() {
+  const nm = S.name || 'Your companion';
+  $app.replaceChildren(h('div', { class: 'phone' }, topbar(), h('div', { class: 'screen center-screen' },
+    h('h1', {}, `${nm} is locked in.`),
+    h('p', { class: 'muted' }, 'Wait for the reveal on the main screen.'),
+    S.phase === 'design' ? h('button', { class: 'btn secondary', onclick: () => socket.emit('student:unlock', {}, () => {}) }, 'Change my answers') : null,
+  )));
+}
+
+function revealScreen() {
+  const sc = S.myScore;
+  const body = h('div', { class: 'screen' }, h('h2', { style: 'margin-top:8px' }, 'Look up at the screen.'));
+  if (sc) {
+    body.append(h('div', { class: 'score-card' },
+      h('p', { class: 'muted' }, `How much of a real friendship's give-and-take ${S.name || 'your companion'} keeps, from 0 (a mirror) to 100 (a friend):`),
+      h('div', { class: 'big-score' }, sc.total),
+      S.roomScore !== null ? h('p', { class: 'muted', style: 'margin-top:8px' }, `Room average: ${S.roomScore}`) : null,
+      h('div', { class: 'pillar-mini' }, CQ.PILLARS.map((p) => h('div', { class: 'row' },
+        h('div', {}, h('div', {}, p.label), h('div', { class: 'bar' }, h('i', { style: `width:${sc.pillars[p.id]}%` }))),
+        h('strong', {}, sc.pillars[p.id])))),
+    ));
+  } else body.append(h('p', { class: 'muted' }, 'You did not lock in a companion this time.'));
+  $app.replaceChildren(h('div', { class: 'phone' }, topbar(), body));
+}
+
+function followupScreen() {
+  const body = h('div', { class: 'screen' }, h('h2', { style: 'margin-top:8px' }, 'Look at what the room built'));
+  CQ.FOLLOWUPS.forEach((f) => {
+    const group = h('div', { class: 'choices', role: 'radiogroup', 'aria-label': f.question });
+    f.options.forEach((o) => group.append(h('button', { class: 'choice', role: 'radio', type: 'button', 'aria-checked': String(S.followup[f.id] === o.id),
+      onclick: () => socket.emit('student:followup', { id: f.id, option: o.id }) }, h('span', { class: 'dot' }), h('span', {}, o.label))));
+    body.append(h('div', { class: 'qblock vote' }, h('h3', {}, f.question), group));
+  });
+  $app.replaceChildren(h('div', { class: 'phone' }, topbar(), body));
+}
+socket.on('student:state', () => { if (S && S.phase === 'followup') followupScreen(); });
+
+// ---------------------------------------------------------- chat
+function initials(n) { return (n || '?').trim().slice(0, 1).toUpperCase(); }
+function chatListScreen() {
+  const body = h('div', { class: 'screen' }, h('h2', { style: 'margin-top:8px' }, 'Talk to a companion'));
+  if (!S.bots.length) body.append(h('p', { class: 'muted' }, 'Lock in a companion first, then come back here.'));
+  if (!S.locked) {
+    page = 0;
+    body.append(h('button', { class: 'btn block', style: 'margin-bottom:16px', onclick: () => { lateDesign = true; render(); } }, 'Design my companion'));
+  }
+  S.bots.forEach((b) => body.append(h('button', { class: 'bot-row', onclick: () => openChat(b.id) },
+    h('span', { class: 'avatar' + (b.isClass ? ' class' : '') }, b.isClass ? '∑' : initials(b.name)),
+    h('span', {}, h('div', {}, h('strong', {}, b.name)), h('div', { class: 'sub' }, b.mine ? 'The one you designed' : b.isClass ? "Built from the whole room's answers" : "A classmate's companion")))));
+  $app.replaceChildren(h('div', { class: 'phone' }, topbar(), body));
+}
+
+function openChat(botId) {
+  socket.emit('chat:open', { botId }, (r) => {
+    if (r.error) return alertInline(r.error);
+    chat = { meta: r.meta, messages: r.messages, ended: r.ended, typing: false };
+    chatScreen();
+  });
+}
+function alertInline(msg) { const e = $app.querySelector('.error') || $app.appendChild(h('p', { class: 'error', style: 'padding:0 18px' })); e.textContent = msg; }
+
+function chatScreen() {
+  const m = chat.meta;
+  const log = h('div', { class: 'log', 'aria-live': 'polite' });
+  const editLabel = m.mine ? ({ anytime: 'Edit', agreement: 'Ask to change', never: 'Locked' }[m.edit]) : null;
+  const head = h('div', { class: 'chat-head' },
+    h('button', { class: 'back', 'aria-label': 'Back to companions', onclick: () => { socket.emit('chat:close'); chat = null; render(); } }, '‹'),
+    h('span', { class: 'avatar' + (m.botId === 'class' ? ' class' : '') }, m.botId === 'class' ? '∑' : initials(m.name)),
+    h('span', { class: 'name' }, m.name),
+    editLabel ? h('button', { class: 'btn small secondary', disabled: m.edit === 'never' || chat.ended, title: m.edit === 'never' ? 'You chose: never, it is who it is' : '', onclick: openEditor }, editLabel) : null,
+  );
+  const ta = h('textarea', { rows: 1, placeholder: chat.ended ? 'This relationship has ended' : 'Message', disabled: chat.ended, 'aria-label': 'Message' });
+  const send = h('button', { class: 'btn', disabled: chat.ended }, 'Send');
+  const doSend = () => {
+    const t = ta.value.trim(); if (!t || chat.typing) return;
+    socket.emit('chat:send', { botId: m.botId, text: t }, (r) => {
+      if (r.error) { addMsg({ role: 'notice', content: r.error }); return; }
+      ta.value = ''; ta.style.height = '';
+      addMsg({ role: 'user', content: t });
+    });
+  };
+  send.addEventListener('click', doSend);
+  ta.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doSend(); } });
+  ta.addEventListener('input', () => { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 120) + 'px'; });
+
+  $app.replaceChildren(h('div', { class: 'chat' }, head, log, h('div', { class: 'compose' }, ta, send)));
+  chat.log = log;
+  if (!chat.messages.length && m.reach === 'never') log.append(h('div', { class: 'hint' }, `${m.name} never starts conversations. Say hi.`));
+  chat.messages.forEach((x) => log.append(msgEl(x)));
+  if (chat.typing) setTyping(true);
+  log.scrollTop = log.scrollHeight;
+}
+function msgEl(x) { return h('div', { class: `msg ${x.role}${x.unprompted ? ' unprompted' : ''}` }, x.content); }
+function addMsg(x) {
+  if (!chat) return;
+  chat.messages.push(x);
+  const hint = chat.log.querySelector('.hint'); if (hint) hint.remove();
+  const t = chat.log.querySelector('.typing');
+  chat.log.insertBefore(msgEl(x), t);
+  chat.log.scrollTop = chat.log.scrollHeight;
+}
+function setTyping(on) {
+  if (!chat || !chat.log) return;
+  chat.typing = on;
+  let t = chat.log.querySelector('.typing');
+  if (on && !t) { chat.log.append(h('div', { class: 'typing' }, `${chat.meta.name} is typing…`)); chat.log.scrollTop = chat.log.scrollHeight; }
+  if (!on && t) t.remove();
+}
+let bannerTimer;
+function banner(from, text) {
+  document.getElementById('bannerFrom').textContent = from;
+  document.getElementById('bannerText').textContent = text;
+  const b = document.getElementById('banner'); b.classList.add('show');
+  try { navigator.vibrate && navigator.vibrate([80, 60, 80]); } catch {}
+  clearTimeout(bannerTimer); bannerTimer = setTimeout(() => b.classList.remove('show'), 4500);
+}
+socket.on('chat:message', ({ botId, msg }) => {
+  if (!chat || chat.meta.botId !== botId) return;
+  addMsg(msg);
+  if (msg.unprompted && (chat.meta.where === 'texts' || chat.meta.where === 'everywhere') && chat.messages.length > 1) banner(chat.meta.name, msg.content);
+});
+socket.on('chat:typing', ({ botId, on }) => { if (chat && chat.meta.botId === botId) setTyping(on); });
+socket.on('chat:ended', ({ botId }) => { if (chat && chat.meta.botId === botId) { chat.ended = true; chatScreen(); } });
+socket.on('chat:meta', (meta) => { if (chat && chat.meta.botId === meta.botId) { chat.meta = meta; chatScreen(); } });
+
+function openEditor() {
+  editing = { ...S.answers };
+  // S.answers holds the current (possibly edited) settings for my own companion
+  const body = h('div', { class: 'screen' },
+    h('h2', {}, chat.meta.edit === 'agreement' ? `Ask ${chat.meta.name} to change` : `Edit ${chat.meta.name}`),
+    h('p', { class: 'muted' }, chat.meta.edit === 'agreement' ? 'You chose that it has to agree to any change. It will answer in the chat.' : 'You chose that you can change anything, anytime. It will not get a say.'));
+  CQ.PILLARS.forEach((p) => {
+    body.append(h('h3', { style: 'margin:18px 0 10px' }, p.label));
+    p.questions.forEach((q) => body.append(questionEl(q, editing, () => {})));
+  });
+  const close = () => modal.remove();
+  const save = h('button', { class: 'btn' }, chat.meta.edit === 'agreement' ? 'Ask' : 'Save changes');
+  save.addEventListener('click', () => {
+    socket.emit('chat:edit', { answers: editing }, (r) => {
+      close();
+      if (r.error) addMsg({ role: 'notice', content: r.error });
+      else if (r.message) addMsg({ role: 'notice', content: r.message });
+      if (r.meta) { chat.meta = r.meta; chatScreen(); }
+    });
+  });
+  const modal = h('div', { class: 'modal', role: 'dialog', 'aria-label': 'Edit companion' }, h('div', { class: 'phone' }, body,
+    h('div', { class: 'sticky-bar' }, h('div', { class: 'inner' }, h('button', { class: 'btn secondary', onclick: close }, 'Cancel'), save))));
+  document.body.append(modal);
+}
+
+// ---------------------------------------------------------- router
+function render() {
+  if (!S) return joinScreen();
+  if (S.phase === 'chat') {
+    if (!S.locked && lateDesign) return designScreen();
+    if (chat) return chatScreen();
+    return chatListScreen();
+  }
+  if (S.phase === 'design') return S.locked ? lockedScreen() : designScreen();
+  if (S.phase === 'reveal') return revealScreen();
+  if (S.phase === 'followup') return followupScreen();
+}
+joinScreen();
+</script>
+</body>
+</html>
